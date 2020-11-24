@@ -1,109 +1,53 @@
-
-Implementation of RFC3489-compatible full cone SNAT.
-
-Assuming eth0 is external interface:
+## stun类型检测工具下载
+http://sourceforge.net/projects/stun/
+## 知识介绍
+https://blog.csdn.net/u011245325/article/details/9294229
+## 内核实现full-core-nat
+需要拓展iptables，和内核patch。只有udp
+### 知识文档
+https://blog.chionlab.moe/2018/02/09/full-cone-nat-with-linux/
+### 代码 
+linux ：https://github.com/Chion82/netfilter-full-cone-nat
+openwrt ：https://github.com/LGA1150/openwrt-fullconenat
+### 使用
+#### 编译安装
+1. 内核开启CONFIG_NF_CONNTRACK_EVENTS，
+2. 应用层同级目录创建iptables头文件及libxtables.so(自行编译或者x86可使用目录中对应头文件和库文件)
+3. 修改makefile一次性编译so和ko
+4. 拷贝应用iptables的库文件到iptables的库目录
+/usr/lib/xtables/libipt_FULLCONENAT.so
+5. 加载内核模块
+insmod xt_FULLCONENAT.ko
+#### 配置nat1全锥形类型
 ```
-iptables -t nat -A POSTROUTING -o eth0 -j FULLCONENAT #same as MASQUERADE  
-iptables -t nat -A PREROUTING -i eth0 -j FULLCONENAT  #automatically restore NAT for inbound packets
+iptables -F ;iptables -F -t nat;
+iptables -t nat -A POSTROUTING -o eth0 -j FULLCONENAT;
+iptables -t nat -A PREROUTING -i eth0 -j FULLCONENAT;
 ```
-Currently only UDP traffic is supported for full-cone NAT. For other protos FULLCONENAT is equivalent to MASQUERADE.
-
-Build
-======
-Prerequisites: 
-* kernel source  
-* iptables source ( git://git.netfilter.org/iptables.git ) 
-
-Confirm the kernel configuration option `CONFIG_NF_CONNTRACK_EVENTS` is enabled. If this option is disabled on your system, enable it and rebuild your netfilter modules.
-
-Kernel Module
--------------
+#### 配置nat2 ip受限类型
 ```
-$ make
-# insmod xt_FULLCONENAT.ko
+insmod xt_FULLCONENAT.ko g_type=2
+iptables -F ;iptables -F -t nat;
+iptables -t nat -A POSTROUTING -o eth0 -j FULLCONENAT;
+iptables -t nat -A PREROUTING -i eth0 -j FULLCONENAT;
 ```
-
-Iptables Extension
-------------------
-
-1. Copy libipt_FULLCONENAT.c to `iptables-source/extensions`.
-
-2. Under the iptables source directory, `./configure`(use `--prefix` to replace your current `iptables` by looking at `which iptables`), `make` and `make install`
-
-OpenWRT
--------
-Package for openwrt is available at https://github.com/LGA1150/openwrt-fullconenat
-
-Usage
-=====
-
-Assuming eth0 is external interface:
-
-Basic Usage:
-
+#### 配置nat3 端口受限类型1
 ```
-iptables -t nat -A POSTROUTING -o eth0 -j FULLCONENAT
-iptables -t nat -A PREROUTING -i eth0 -j FULLCONENAT
+insmod xt_FULLCONENAT.ko g_type=3
+iptables -F ;iptables -F -t nat;
+iptables -t nat -A POSTROUTING -o eth0 -j FULLCONENAT;
+iptables -t nat -A PREROUTING -i eth0 -j FULLCONENAT;
 ```
-
-Random port range:
-
+#### 配置nat3 端口受限类型2
+LINUX默认的MASQUERADE 规则即为端口受限类型
 ```
-iptables -t nat -A POSTROUTING -o eth0 ! -p udp -j MASQUERADE
-iptables -t nat -A POSTROUTING -o eth0 -p udp -j FULLCONENAT --to-ports 40000-60000 --random-fully
-
-iptables -t nat -A PREROUTING -i eth0 -p udp -m multiport --dports 40000:60000 -j FULLCONENAT
+iptables -F ;iptables -F -t nat;
+rmmod xt_FULLCONENAT;
+iptables -t nat -I POSTROUTING -o eth0 -j MASQUERADE;
 ```
-
-Hairpin NAT (Assuming eth1 is LAN interface and IP range for LAN is 192.168.100.0/24):
+#### 配置nat4 对称型nat
+LINUX默认的MASQUERADE 规则添加端口随机属性即为对称型
 ```
-iptables -t nat -A POSTROUTING -o eth0 -j FULLCONENAT
-iptables -t nat -A POSTROUTING -o eth1 -s 192.168.100.0/24 -j MASQUERADE
-iptables -t nat -A PREROUTING -i eth0 -j FULLCONENAT
-iptables -t nat -A PREROUTING -i eth1 -j FULLCONENAT
+iptables -F ;iptables -F -t nat;
+iptables -t nat -I POSTROUTING -o eth0 -j MASQUERADE --random;
 ```
-
-kernel Patch (Optional.)
-========================
-1. Copy xt_FULLCONENAT.c to `kernel-source/net/netfilter/xt_FULLCONENAT.c`   
-2. Append following line to `kernel-source/net/netfilter/Makefile`:
-
-```
-obj-$(CONFIG_NETFILTER_XT_TARGET_FULLCONENAT) += xt_FULLCONENAT.o
-```
-
-3. Insert following section into `kernel-source/net/ipv4/netfilter/Kconfig` right after `config IP_NF_TARGET_NETMAP` section:
-
-```
-config IP_NF_TARGET_FULLCONENAT
-  tristate "FULLCONENAT target support"
-  depends on NETFILTER_ADVANCED
-  select NETFILTER_XT_TARGET_FULLCONENAT
-  ---help---
-  This is a backwards-compat option for the user's convenience
-  (e.g. when running oldconfig). It selects
-  CONFIG_NETFILTER_XT_TARGET_FULLCONENAT.
-
-```
-
-4. Insert following section into `kernel-source/net/netfilter/Kconfig` right after `config NETFILTER_XT_TARGET_NETMAP` section:
-
-```
-config NETFILTER_XT_TARGET_FULLCONENAT
-  tristate '"FULLCONENAT" target support'
-  depends on NF_NAT
-  ---help---
-  Full Cone NAT
-
-  To compile it as a module, choose M here. If unsure, say N.
-
-```
-
-5. Run `make menuconfig` and select:
-    Networking support -> Network options -> Network packet filtering framework (Netfilter) -> IP: Netfilter Configuration -> \<M\> FULLCONENAT target support
-
-License
-=======
-Copyright 2018 Chion Tang [betaidc](https://www.betaidc.com/contact.html)  
-GPL-2.0  
-See LICENSE

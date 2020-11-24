@@ -28,6 +28,20 @@
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_ecache.h>
 
+
+enum nat_type {
+	FULLCONENAT = 1,
+	RESTRICTEDCONENAT,
+	PORTRESTRICTEDCONENAT,
+	SYMMETRICNAT,
+};
+
+static int g_type = FULLCONENAT; // default
+
+module_param(g_type,int,0660);
+
+
+
 #define HASH_2(x, y) ((x + y) / 2 * (x + y + 1) + y)
 
 #define HASHTABLE_BUCKET_BITS 10
@@ -375,7 +389,7 @@ static int ct_event_cb(unsigned int events, struct nf_ct_event *item) {
   spin_unlock_bh(&dying_tuple_list_lock);
 
   if (wq != NULL)
-    queue_delayed_work(wq, &gc_worker_wk, msecs_to_jiffies(100));
+    queue_delayed_work(wq, &gc_worker_wk, msecs_to_jiffies(1000));
 
   return 0;
 }
@@ -457,6 +471,47 @@ static uint16_t find_appropriate_port(struct net *net, const struct nf_conntrack
   return selected;
 }
 
+
+//
+static int ip_filter_nat(struct nf_conntrack_tuple *ct_tuple_origin,struct nat_mapping *mapping,int type){
+	struct list_head *iter_2, *tmp_2;
+	__be32 ip,map_ip;
+	uint16_t port,map_port;
+	struct nat_mapping_original_tuple *original_tuple_item=NULL;
+	int ret = 0;
+	if(type == FULLCONENAT){
+		return 1;
+	}
+	if(type > PORTRESTRICTEDCONENAT){
+		return 0;
+	}
+	ip = (ct_tuple_origin->src).u3.ip;
+    port = be16_to_cpu((ct_tuple_origin->src).u.udp.port);
+	list_for_each_safe(iter_2, tmp_2, &mapping->original_tuple_list) {
+      original_tuple_item = list_entry(iter_2, struct nat_mapping_original_tuple, node);
+		map_ip = (original_tuple_item->tuple.dst).u3.ip;
+		map_port = be16_to_cpu((original_tuple_item->tuple.dst).u.udp.port);
+		if(type == PORTRESTRICTEDCONENAT){
+			if(map_ip == ip && map_port == port){
+				ret = 1;
+				break;
+			}
+		}else if(type == RESTRICTEDCONENAT){
+			if(map_ip == ip){
+				ret = 1;
+				break;
+			}
+		}
+    }
+	if(ret){
+		pr_debug("< DNAT> %s ==>input server src %pI4:%d  client map %pI4:%d\n", nf_ct_stringify_tuple(&original_tuple_item->tuple),&ip, port , &mapping->int_addr, mapping->int_port);
+	}else{
+		pr_debug("< DNAT> ==>input fail server src %pI4:%d  client map %pI4:%d\n",&ip, port , &mapping->int_addr, mapping->int_port);
+	}
+
+	return ret;
+}
+
 static unsigned int fullconenat_tg(struct sk_buff *skb, const struct xt_action_param *par)
 {
   const struct nf_nat_ipv4_multi_range_compat *mr;
@@ -533,20 +588,23 @@ static unsigned int fullconenat_tg(struct sk_buff *skb, const struct xt_action_p
       return ret;
     }
     if (check_mapping(mapping, net, zone)) {
-      newrange.flags = NF_NAT_RANGE_MAP_IPS | NF_NAT_RANGE_PROTO_SPECIFIED;
-      newrange.min_addr.ip = mapping->int_addr;
-      newrange.max_addr.ip = mapping->int_addr;
-      newrange.min_proto.udp.port = cpu_to_be16(mapping->int_port);
-      newrange.max_proto = newrange.min_proto;
+	  if(ip_filter_nat(ct_tuple_origin,mapping,g_type)){
 
-      pr_debug("xt_FULLCONENAT: <INBOUND DNAT> %s ==> %pI4:%d\n", nf_ct_stringify_tuple(ct_tuple_origin), &mapping->int_addr, mapping->int_port);
+		  newrange.flags = NF_NAT_RANGE_MAP_IPS | NF_NAT_RANGE_PROTO_SPECIFIED;
+		  newrange.min_addr.ip = mapping->int_addr;
+		  newrange.max_addr.ip = mapping->int_addr;
+		  newrange.min_proto.udp.port = cpu_to_be16(mapping->int_port);
+		  newrange.max_proto = newrange.min_proto;
 
-      ret = nf_nat_setup_info(ct, &newrange, HOOK2MANIP(xt_hooknum(par)));
+		  pr_debug("xt_FULLCONENAT: <INBOUND DNAT> %s ==> %pI4:%d\n", nf_ct_stringify_tuple(ct_tuple_origin), &mapping->int_addr, mapping->int_port);
 
-      if (ret == NF_ACCEPT) {
-        add_original_tuple_to_mapping(mapping, ct_tuple_origin);
-        pr_debug("xt_FULLCONENAT: fullconenat_tg(): INBOUND: refer_count for mapping at ext_port %d is now %d\n", mapping->port, mapping->refer_count);
-      }
+		  ret = nf_nat_setup_info(ct, &newrange, HOOK2MANIP(xt_hooknum(par)));
+
+		  if (ret == NF_ACCEPT) {
+			add_original_tuple_to_mapping(mapping, ct_tuple_origin);
+			pr_debug("xt_FULLCONENAT: fullconenat_tg(): INBOUND: refer_count for mapping at ext_port %d is now %d,add tuple %s\n", port, mapping->refer_count,nf_ct_stringify_tuple(ct_tuple_origin));
+		  }
+	  }
     }
     spin_unlock_bh(&fullconenat_lock);
     return ret;
@@ -622,7 +680,7 @@ static unsigned int fullconenat_tg(struct sk_buff *skb, const struct xt_action_p
     }
     if (mapping != NULL) {
       add_original_tuple_to_mapping(mapping, ct_tuple_origin);
-      pr_debug("xt_FULLCONENAT: fullconenat_tg(): OUTBOUND: refer_count for mapping at ext_port %d is now %d\n", mapping->port, mapping->refer_count);
+      pr_debug("xt_FULLCONENAT: fullconenat_tg(): OUTBOUND: refer_count for mapping at ext_port %d is now %d,add tuple %s\n", port, mapping->refer_count,nf_ct_stringify_tuple(ct_tuple_origin));
     }
 
     spin_unlock_bh(&fullconenat_lock);
@@ -731,3 +789,4 @@ MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Xtables: implementation of RFC3489 full cone NAT");
 MODULE_AUTHOR("Chion Tang <tech@chionlab.moe>");
 MODULE_ALIAS("ipt_FULLCONENAT");
+MODULE_VERSION("1.1");
